@@ -58,6 +58,9 @@ def load_configuration():
         # Agent Configuration
         "MD_OUTPUT_DIR": os.getenv("MD_OUTPUT_DIR", "genesis_outputs"),
         "ERROR_LOG_FILE": os.getenv("ERROR_LOG_FILE", "genesis_error.log"),
+        # Add configurable bounds for history and feedback
+        "MAX_HISTORY_LENGTH": int(os.getenv("MAX_HISTORY_LENGTH", "100")),
+        "MAX_FEEDBACK_HISTORY": int(os.getenv("MAX_FEEDBACK_HISTORY", "10")),
     }
     # Validation
     required_gcp = ["VERTEX_AI_PROJECT", "VERTEX_AI_LOCATION"]
@@ -95,16 +98,124 @@ MD_OUTPUT_DIR = config["MD_OUTPUT_DIR"]
 ERROR_LOG_FILE = config["ERROR_LOG_FILE"]
 MAX_GEMINI_RETRIES = 2
 MAX_TOOL_RETRIES = 2
-FEEDBACK_HISTORY_LENGTH = 10
+FEEDBACK_HISTORY_LENGTH = config["MAX_FEEDBACK_HISTORY"]
+MAX_HISTORY_LENGTH = config["MAX_HISTORY_LENGTH"]
 
-# --- State Management ---
-class AgentState:
+# --- State Management with Thread Safety ---
+class BoundedList(list):
+    """A list with a maximum length that automatically trims oldest items."""
+    def __init__(self, maxlen=100):
+        super().__init__()
+        self.maxlen = maxlen
+        
+    def append(self, item):
+        super().append(item)
+        if len(self) > self.maxlen:
+            self.pop(0)
+
+class ThreadSafeAgentState:
+    """Thread-safe version of AgentState with proper locking."""
     def __init__(self):
-        self.mode = "AUTONOMOUS"; self.working_memory = {}; self.current_task_input = INITIAL_PROMPT; self.autonomous_paused_state = None
-agent_state = AgentState()
+        self._lock = threading.RLock()
+        self._mode = "AUTONOMOUS"
+        self._working_memory = {}
+        self._current_task_input = INITIAL_PROMPT
+        self._autonomous_paused_state = None
+        
+        # Initialize with bounded collections
+        with self._lock:
+            self._working_memory['history'] = BoundedList(maxlen=MAX_HISTORY_LENGTH)
+            self._working_memory['feedback_history'] = BoundedList(maxlen=FEEDBACK_HISTORY_LENGTH)
+            self._working_memory['known_custom_tags'] = set()
+        
+    @property
+    def mode(self):
+        with self._lock:
+            return self._mode
+            
+    @mode.setter
+    def mode(self, value):
+        with self._lock:
+            self._mode = value
+    
+    @property
+    def current_task_input(self):
+        with self._lock:
+            return self._current_task_input
+            
+    @current_task_input.setter
+    def current_task_input(self, value):
+        with self._lock:
+            self._current_task_input = value
+    
+    @property
+    def autonomous_paused_state(self):
+        with self._lock:
+            return self._autonomous_paused_state
+            
+    @autonomous_paused_state.setter
+    def autonomous_paused_state(self, value):
+        with self._lock:
+            self._autonomous_paused_state = value
+    
+    @property
+    def working_memory(self):
+        # Return a copy to avoid direct modification
+        with self._lock:
+            # Use deepcopy if needed for nested structures
+            return dict(self._working_memory)
+    
+    def update_working_memory(self, key, value):
+        """Thread-safe update of a working memory key."""
+        with self._lock:
+            self._working_memory[key] = value
+            
+    def get_working_memory(self, key, default=None):
+        """Thread-safe access to working memory."""
+        with self._lock:
+            return self._working_memory.get(key, default)
+            
+    def append_to_history(self, item):
+        """Thread-safe append to history list."""
+        with self._lock:
+            if 'history' not in self._working_memory:
+                self._working_memory['history'] = BoundedList(maxlen=MAX_HISTORY_LENGTH)
+            self._working_memory['history'].append(item)
+            
+    def append_to_feedback(self, item):
+        """Thread-safe append to feedback history."""
+        with self._lock:
+            if 'feedback_history' not in self._working_memory:
+                self._working_memory['feedback_history'] = BoundedList(maxlen=FEEDBACK_HISTORY_LENGTH)
+            self._working_memory['feedback_history'].append(item)
+            
+    def add_tags(self, tags):
+        """Thread-safe addition of tags."""
+        with self._lock:
+            if 'known_custom_tags' not in self._working_memory:
+                self._working_memory['known_custom_tags'] = set()
+            if isinstance(tags, (list, set)):
+                self._working_memory['known_custom_tags'].update(set(str(tag).lower().strip() for tag in tags if tag))
+            
+    def pop_working_memory(self, key, default=None):
+        """Thread-safe pop from working memory."""
+        with self._lock:
+            return self._working_memory.pop(key, default)
+            
+    def reset_working_memory(self, preserve_tags=True):
+        """Reset working memory while optionally preserving tags."""
+        with self._lock:
+            known_tags = self._working_memory.get('known_custom_tags', set()) if preserve_tags else set()
+            self._working_memory = {
+                'history': BoundedList(maxlen=MAX_HISTORY_LENGTH),
+                'feedback_history': BoundedList(maxlen=FEEDBACK_HISTORY_LENGTH),
+                'known_custom_tags': known_tags
+            }
+
+# Initialize the thread-safe agent state
+agent_state = ThreadSafeAgentState()
 
 # --- Memory Systems Implementation ---
-# (store_output_md, get_embedding, store_in_ltr, query_ltr remain structurally the same)
 def store_output_md(content, topic_keywords):
     try:
         output_dir = config["MD_OUTPUT_DIR"];
@@ -177,8 +288,25 @@ def query_ltr(query_text: str, top_k: int = 5, filters: list[dict] = None) -> li
         else: logging.info("No neighbors found in LTR for the query."); return []
     except Exception as e: log_error(f"Failed to query LTR: {e}"); return []
 
+# --- Response Schema Validation Utility ---
+def validate_response_schema(response, required_keys, default_values=None):
+    """Validates a response against required keys and provides defaults if missing."""
+    if not response:
+        return default_values or {}
+        
+    if not all(k in response for k in required_keys):
+        missing_keys = [k for k in required_keys if k not in response]
+        log_error(f"Response missing required keys: {missing_keys}")
+        
+        # Add default values for missing keys
+        if default_values:
+            for key in missing_keys:
+                if key in default_values:
+                    response[key] = default_values[key]
+    
+    return response
+
 # --- LLM Call Implementation Structure ---
-# (_call_gemini_with_retry, call_gemini_flash_lite, call_gemini_flash_std, call_gemini_pro remain the same)
 DEFAULT_SAFETY_SETTINGS = { HarmCategory.HARM_CATEGORY_HARASSMENT: SafetySetting.HarmBlockThreshold.BLOCK_NONE, HarmCategory.HARM_CATEGORY_HATE_SPEECH: SafetySetting.HarmBlockThreshold.BLOCK_NONE, HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: SafetySetting.HarmBlockThreshold.BLOCK_NONE, HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: SafetySetting.HarmBlockThreshold.BLOCK_NONE, }
 def _call_gemini_with_retry(model: GenerativeModel, prompt: str, task_description: str, generation_config: GenerationConfig = None):
     if not model: log_error(f"Gemini model for '{task_description}' not initialized."); return None
@@ -202,7 +330,7 @@ def _call_gemini_with_retry(model: GenerativeModel, prompt: str, task_descriptio
             except json.JSONDecodeError: log_error(f"Failed to parse JSON response from {task_description}: {response_text}"); raise ValueError("LLM did not return valid JSON.")
         except Exception as e:
             attempts += 1; log_error(f"Attempt {attempts}/{MAX_GEMINI_RETRIES+1} failed for {task_description}: {e}")
-            if attempts > MAX_GEMINI_RETRIES: logging.critical(f"CRITICAL: Gemini call failed after {attempts} attempts for task '{task_description}'. Aborting simulation."); print(f"FATAL ERROR: Gemini call failed for task '{task_description}'. Aborting.", file=sys.stderr); sys.exit(1)
+            if attempts > MAX_GEMINI_RETRIES: logging.critical(f"CRITICAL: Gemini call failed after {attempts} attempts for task '{task_description}'. Trying to continue."); return None
             time.sleep(2 ** attempts)
     return None
 def call_gemini_flash_lite(prompt, task_description): global gemini_flash_lite_model; config = GenerationConfig(temperature=0.6, top_p=0.9, candidate_count=1, response_mime_type="application/json"); return _call_gemini_with_retry(gemini_flash_lite_model, prompt, task_description, config)
@@ -210,7 +338,6 @@ def call_gemini_flash_std(prompt, task_description): global gemini_flash_std_mod
 def call_gemini_pro(prompt, task_description): global gemini_pro_model; config = GenerationConfig(temperature=0.9, top_p=0.95, candidate_count=1, response_mime_type="application/json"); return _call_gemini_with_retry(gemini_pro_model, prompt, task_description, config)
 
 # --- Tool Execution Implementation ---
-# (_tool_retry_wrapper and implemented tools remain the same)
 def _tool_retry_wrapper(tool_func, *args, **kwargs):
     attempts = 0
     while attempts <= MAX_TOOL_RETRIES:
@@ -221,9 +348,6 @@ def _tool_retry_wrapper(tool_func, *args, **kwargs):
             time.sleep(1 * attempts)
     return f"Error executing tool {tool_func.__name__} after retries."
 
-# (execute_Google_Search, execute_wikipedia_search, execute_google_books,
-#  execute_arxiv_search, execute_news_search, execute_wolfram_alpha, execute_calculator
-#  remain the same)
 def execute_Google_Search(query: str) -> str:
     logging.info(f"--- TOOL: Google Search: Query: {query} ---")
     api_key = config.get("GOOGLE_API_KEY")
@@ -342,14 +466,20 @@ def execute_wolfram_alpha(query: str) -> str:
     except requests.exceptions.RequestException as req_err: logging.error(f"Wolfram Alpha request error occurred: {req_err}"); raise
     except Exception as e: log_error(f"Unexpected error during Wolfram Alpha execution: {e}"); raise
 
+# Fixed AST nodes list for calculator
 _ALLOWED_OPERATORS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv, ast.Pow: operator.pow, ast.USub: operator.neg}
-_ALLOWED_NODES = {'Expression', 'Constant', 'Name', 'Load', 'BinOp', 'UnaryOp', 'Call', 'Add', 'Sub', 'Mult', 'Div', 'Pow', 'USub'} # Removed 'Num' for py 3.8+ compatibility
+_ALLOWED_NODES = {'Expression', 'Constant', 'Name', 'Load', 'BinOp', 'UnaryOp', 'Call', 'Add', 'Sub', 'Mult', 'Div', 'Pow', 'USub'} # 'Num' removed as noted in comments
+
 def _safe_eval_node(node):
     if isinstance(node, ast.Constant): return node.value # Handles numbers, strings, None in Python 3.8+
-    # elif isinstance(node, ast.Num): return node.n # For older Python versions
     elif isinstance(node, ast.BinOp):
         op = _ALLOWED_OPERATORS.get(type(node.op))
-        if op: left = _safe_eval_node(node.left); right = _safe_eval_node(node.right);
+        if not op:
+            raise TypeError(f"Unsupported binary operator: {type(node.op).__name__}")
+            
+        left = _safe_eval_node(node.left)
+        right = _safe_eval_node(node.right)
+        
         # Ensure operands are numeric before operation
         if isinstance(left, (int, float)) and isinstance(right, (int, float)):
             # Check for division by zero before attempting division
@@ -358,15 +488,19 @@ def _safe_eval_node(node):
             return op(left, right)
         else:
             raise TypeError(f"Unsupported operand types for {type(node.op).__name__}: {type(left).__name__} and {type(right).__name__}")
-        raise TypeError(f"Unsupported binary operator: {type(node.op).__name__}") # Should be unreachable if op is found, but good practice
     elif isinstance(node, ast.UnaryOp):
         op = _ALLOWED_OPERATORS.get(type(node.op))
-        if op: operand = _safe_eval_node(node.operand);
-        if isinstance(operand, (int, float)): return op(operand)
+        if not op:
+            raise TypeError(f"Unsupported unary operator: {type(node.op).__name__}")
+            
+        operand = _safe_eval_node(node.operand)
+        if isinstance(operand, (int, float)): 
+            return op(operand)
         else:
-             raise TypeError(f"Unsupported operand type for {type(node.op).__name__}: {type(operand).__name__}")
-        raise TypeError(f"Unsupported unary operator: {type(node.op).__name__}") # Should be unreachable
-    else: raise TypeError(f"Unsupported node type: {type(node).__name__}")
+            raise TypeError(f"Unsupported operand type for {type(node.op).__name__}: {type(operand).__name__}")
+    else: 
+        raise TypeError(f"Unsupported node type: {type(node).__name__}")
+
 def execute_calculator(expression: str) -> str:
     logging.info(f"--- TOOL: Calculator: Expression: {expression} ---")
     if not isinstance(expression, str): return "Error: Input expression must be a string."
@@ -392,8 +526,6 @@ def execute_calculator(expression: str) -> str:
     except SyntaxError: log_error(f"Calculator: Invalid syntax in expression '{expression}'"); return "Error: Invalid syntax in expression."
     except (TypeError, ValueError, ZeroDivisionError) as e: log_error(f"Calculator: Error evaluating expression '{expression}': {e}"); return f"Error: {e}"
     except Exception as e: log_error(f"Calculator: Unexpected error evaluating '{expression}': {e}"); return "Error: Could not evaluate expression."
-# --- End Calculator Tool ---
-
 
 # Map tool names to functions - Wrap external API calls with retry logic
 TOOL_FUNCTION_MAP = {
@@ -412,7 +544,7 @@ def decide_tool_needed(current_input, working_memory):
     """Implements Step 2: Decide if a tool is needed."""
     logging.info("--- STEP 2: Deciding if Tool Needed ---")
     # --- Updated Prompt ---
-    prompt = f"""You are Genesis, an autonomous exploration agent. Your goal is to decide whether external tools or APIs are necessary to handle the user’s input, or if your internal reasoning is sufficient.
+    prompt = f"""You are Genesis, an autonomous exploration agent. Your goal is to decide whether external tools or APIs are necessary to handle the user's input, or if your internal reasoning is sufficient.
 
 Evaluate:
 1. Is the user asking about recent events (requiring News or Search), specific factual lookups (Wikipedia, Search, Books, arXiv), complex calculations (Wolfram Alpha, Calculator), or data retrieval beyond your current knowledge?
@@ -427,7 +559,12 @@ Based on this evaluation, is an external tool necessary?
 Respond ONLY with JSON in the format: {{"tool_needed": boolean, "reason": string}}"""
     # --- End Updated Prompt ---
     response = call_gemini_flash_lite(prompt, "Decision 1")
-    return response if response else {"tool_needed": False, "reason": "LLM call failed"}
+    
+    # Validate response schema
+    default_values = {"tool_needed": False, "reason": "LLM call failed"}
+    response = validate_response_schema(response, ["tool_needed", "reason"], default_values)
+    
+    return response
 
 def identify_tool(current_input, working_memory):
     """Implements Step 3: Identify the best tool."""
@@ -462,7 +599,12 @@ Respond ONLY with JSON in the format:
 }}"""
     # --- End Updated Prompt ---
     response = call_gemini_flash_std(prompt, "Tool ID")
-    return response if response else {"tool_name": None, "query": None, "reason": "LLM call failed"} # Added query: None
+    
+    # Validate response schema
+    default_values = {"tool_name": None, "query": None, "reason": "LLM call failed"}
+    response = validate_response_schema(response, ["tool_name", "query", "reason"], default_values)
+    
+    return response
 
 def execute_tool(tool_name, query):
     """Handles dispatching to the correct tool function."""
@@ -479,10 +621,6 @@ def execute_tool(tool_name, query):
 
         result = TOOL_FUNCTION_MAP[tool_name](query) # Retry handled by lambda wrapper for external tools
         return result
-    # --- Removed Placeholder Check for Save MD ---
-    # elif tool_name == "Save Output to Local Markdown (.md) File":
-    #     logging.info("--- TOOL: Save MD (Triggered Externally - Placeholder) ---")
-    #     return "Save MD action needs specific trigger logic."
     else:
         log_error(f"Unknown tool selected: {tool_name}")
         return f"Error: Unknown tool '{tool_name}'"
@@ -519,33 +657,41 @@ Respond ONLY with JSON in the format:
     # --- End Updated Prompt ---
     response = call_gemini_pro(prompt, "Analysis")
 
-    # Store results in working memory
-    if response:
-        # Basic validation of response structure
-        if not all(k in response for k in ["summary", "evaluation", "simulated_stance", "suggested_tags", "save_summary_to_md"]):
-             log_error(f"Analysis response missing expected keys: {response}")
-             # Provide a default error structure
-             response = {"summary": "Analysis response structure error.", "evaluation": "unknown", "simulated_stance": None, "suggested_tags": [], "save_summary_to_md": False}
+    # Validate response schema with defaults
+    default_values = {
+        "summary": "Analysis failed.", 
+        "evaluation": "unknown", 
+        "simulated_stance": None, 
+        "suggested_tags": [], 
+        "save_summary_to_md": False
+    }
+    response = validate_response_schema(
+        response, 
+        ["summary", "evaluation", "simulated_stance", "suggested_tags", "save_summary_to_md"],
+        default_values
+    )
 
-        agent_state.working_memory['last_analysis'] = response # Store the whole analysis dict
-        agent_state.working_memory['last_stance'] = response.get('simulated_stance')
-        feedback = { "input": current_input, "tool_used": working_memory.get('last_tool_id', {}).get('tool_name', 'direct_answer/unknown'), "evaluation": response.get('evaluation', 'unknown') }
-        agent_state.working_memory.setdefault('feedback_history', []).append(feedback)
-        agent_state.working_memory['feedback_history'] = agent_state.working_memory['feedback_history'][-FEEDBACK_HISTORY_LENGTH:]
-        suggested_tags = response.get('suggested_tags', [])
-        # Ensure tags are strings and update known tags
-        if isinstance(suggested_tags, list):
-             valid_tags = {str(tag).lower().strip() for tag in suggested_tags if tag and isinstance(tag, str)} # Ensure string, lowercase, strip whitespace, non-empty
-             agent_state.working_memory.setdefault('known_custom_tags', set()).update(valid_tags)
-             response['suggested_tags'] = list(valid_tags) # Update response with cleaned tags
-        else:
-             log_error(f"suggested_tags in analysis response is not a list: {suggested_tags}")
-             response['suggested_tags'] = []
-
-    else: # Handle LLM call failure
-        response = {"summary": "Analysis failed.", "evaluation": "unknown", "simulated_stance": None, "suggested_tags": [], "save_summary_to_md": False} # Default on failure
-        agent_state.working_memory['last_analysis'] = response
-        agent_state.working_memory['last_stance'] = None
+    # Store results in working memory using thread-safe methods
+    agent_state.update_working_memory('last_analysis', response)
+    agent_state.update_working_memory('last_stance', response.get('simulated_stance'))
+    
+    # Store feedback history
+    feedback = {
+        "input": current_input,
+        "tool_used": working_memory.get('last_tool_id', {}).get('tool_name', 'direct_answer/unknown'),
+        "evaluation": response.get('evaluation', 'unknown')
+    }
+    agent_state.append_to_feedback(feedback)
+    
+    # Clean and add tags
+    suggested_tags = response.get('suggested_tags', [])
+    if isinstance(suggested_tags, list):
+        valid_tags = [str(tag).lower().strip() for tag in suggested_tags if tag and isinstance(tag, str)]
+        agent_state.add_tags(valid_tags)
+        response['suggested_tags'] = valid_tags  # Update response with cleaned tags
+    else:
+        log_error(f"suggested_tags in analysis response is not a list: {suggested_tags}")
+        response['suggested_tags'] = []
 
     return response
 
@@ -569,13 +715,13 @@ Should this specific analysis result (primarily the summary and tags) be stored 
 Respond ONLY with JSON in the format: {{"store_result": boolean, "reason": string}}"""
     # --- End Updated Prompt ---
     response = call_gemini_flash_lite(prompt, "Decision 6")
-    # Add validation for response structure
-    if not response or 'store_result' not in response:
-        log_error(f"Decision 6 (Store Intermediate) response invalid: {response}")
-        return {"store_result": False, "reason": "LLM call failed or response invalid"}
+    
+    # Validate response schema
+    default_values = {"store_result": False, "reason": "LLM call failed or response invalid"}
+    response = validate_response_schema(response, ["store_result", "reason"], default_values)
+    
     return response
 
-# --- Updated store_memory_step ---
 def store_memory_step(data_to_store, metadata_context):
     """Handles embedding and storing in LTR (Long-Term Memory)."""
     logging.info("--- STEP 7: Storing in LTR ---")
@@ -625,7 +771,6 @@ def store_memory_step(data_to_store, metadata_context):
     final_metadata = {k: v for k, v in metadata.items()} # Pass the constructed metadata dict
 
     store_in_ltr(embedding, data_id, final_metadata) # store_in_ltr handles restrict creation now
-# --- End updated store_memory_step ---
 
 def decide_next_action(working_memory):
     """Implements Step 8: Decide the next action."""
@@ -661,12 +806,19 @@ def decide_next_action(working_memory):
     else:
         logging.debug("No suitable query found for LTR context retrieval.")
 
-    working_memory['ltr_context_for_decision'] = ltr_context_summary
+    # Store context temporarily for this decision
+    working_memory_copy = dict(working_memory)
+    working_memory_copy['ltr_context_for_decision'] = ltr_context_summary
     # --- End Add LTR Context ---
+    
     # --- Add Feedback Context ---
     feedback_summary = "No recent feedback available."
-    if working_memory.get('feedback_history'): feedback_summary = "Recent Feedback (Input -> Tool -> Evaluation):\n" + "\n".join([f"- '{f.get('input', '')[:30]}...' -> {f.get('tool_used', '?')} -> '{f.get('evaluation', '?')}'" for f in working_memory['feedback_history']])
-    working_memory['recent_feedback_summary'] = feedback_summary
+    if working_memory.get('feedback_history'): 
+        feedback_summary = "Recent Feedback (Input -> Tool -> Evaluation):\n" + "\n".join([
+            f"- '{f.get('input', '')[:30]}...' -> {f.get('tool_used', '?')} -> '{f.get('evaluation', '?')}'" 
+            for f in working_memory['feedback_history']
+        ])
+    working_memory_copy['recent_feedback_summary'] = feedback_summary
     # --- End Add Feedback Context ---
 
     # --- Updated Prompt ---
@@ -674,7 +826,7 @@ def decide_next_action(working_memory):
 Your goal is to decide the next step in your simulation loop. Review the current context, including recent actions, analysis, your simulated stance, potentially relevant long-term memories (LTR), and feedback on recent actions.
 
 Current Context (Working Memory):
-{json.dumps(working_memory, indent=2, default=str, ensure_ascii=False)[:2500]}... # Increased context size slightly
+{json.dumps(working_memory_copy, indent=2, default=str, ensure_ascii=False)[:2500]}... # Increased context size slightly
 
 Available Strategies for Next Action:
 - Deepen Current Topic: Ask a specific follow-up question based on the last analysis or result. Query to address ambiguity or conflicting info. Cross-reference findings with LTR context. Consult saved notes (.md files - specify filename if known/relevant). Refine previous output.
@@ -695,12 +847,19 @@ Respond ONLY with JSON in the format: {{"next_action_type": string (e.g., "Deepe
     # --- End Updated Prompt ---
 
     response = call_gemini_pro(prompt, "Decision 3")
-    working_memory.pop('ltr_context_for_decision', None); working_memory.pop('recent_feedback_summary', None) # Clean up temporary context
-
-    # Add validation for response structure
-    if not response or not all(k in response for k in ["next_action_type", "next_input", "reason", "conclude_task"]):
-        log_error(f"Decision 3 (Next Action) response invalid: {response}")
-        return {"next_action_type": "Error", "next_input": "Recovery: What should I explore next based on recent activity?", "reason": "LLM call failed or response invalid", "conclude_task": False} # Default recovery
+    
+    # Validate response schema
+    default_values = {
+        "next_action_type": "Error", 
+        "next_input": "Recovery: What should I explore next based on recent activity?", 
+        "reason": "LLM call failed or response invalid", 
+        "conclude_task": False
+    }
+    response = validate_response_schema(
+        response, 
+        ["next_action_type", "next_input", "reason", "conclude_task"],
+        default_values
+    )
 
     # Ensure conclude_task matches expectation
     if response.get("next_action_type") == "Conclude" and not response.get("conclude_task"):
@@ -709,7 +868,6 @@ Respond ONLY with JSON in the format: {{"next_action_type": string (e.g., "Deepe
     elif response.get("conclude_task") and response.get("next_action_type") != "Conclude":
          logging.warning(f"Decision 3 set 'conclude_task' to true but action type is '{response.get('next_action_type')}'. Overriding to false.")
          response["conclude_task"] = False
-
 
     return response
 
@@ -733,19 +891,17 @@ Respond ONLY with JSON in the format:
     # --- End Updated Prompt ---
     response = call_gemini_pro(prompt, "Direct Answer")
 
-    # Add validation and update working memory
-    if response and 'answer' in response:
-        agent_state.working_memory['last_direct_answer'] = response.get('answer')
-    else:
-        log_error(f"Direct Answer response invalid or failed: {response}")
-        response = {"answer": "I encountered an issue generating a direct answer. Please try rephrasing or asking something else."}
-        agent_state.working_memory['last_direct_answer'] = response['answer']
-
+    # Validate response schema
+    default_values = {"answer": "I encountered an issue generating a direct answer. Please try rephrasing or asking something else."}
+    response = validate_response_schema(response, ["answer"], default_values)
+    
+    # Update working memory
+    agent_state.update_working_memory('last_direct_answer', response.get('answer'))
+    
     return response
 
 
 # --- Utility Functions ---
-# (log_error remains the same)
 def log_error(message):
     timestamp = datetime.datetime.now().isoformat(); logging.error(message)
     try:
@@ -761,7 +917,6 @@ def log_error(message):
 
 
 # --- Input Handling (Basic Example) ---
-# (check_user_input and input_thread remain the same)
 user_input_queue = queue.Queue()
 def check_user_input():
     """Runs in a separate thread to capture user input without blocking."""
@@ -787,15 +942,44 @@ def check_user_input():
 input_thread = threading.Thread(target=check_user_input, daemon=True)
 input_thread.start()
 
+# --- Graceful Model Initialization ---
+def initialize_gemini_models():
+    """Initializes Gemini models with graceful degradation."""
+    models = {}
+    critical_failure = True
+    
+    try:
+        models["flash_lite"] = GenerativeModel(config['GEMINI_FLASH_LITE_MODEL_NAME'])
+        critical_failure = False  # At least one model initialized
+        logging.info(f"Successfully initialized Gemini Flash Lite model: {config['GEMINI_FLASH_LITE_MODEL_NAME']}")
+    except Exception as e:
+        log_error(f"Failed to initialize Gemini Flash Lite: {e}")
+    
+    try:
+        models["flash_std"] = GenerativeModel(config['GEMINI_FLASH_STD_MODEL_NAME'])
+        critical_failure = False  # At least one model initialized
+        logging.info(f"Successfully initialized Gemini Flash Standard model: {config['GEMINI_FLASH_STD_MODEL_NAME']}")
+    except Exception as e:
+        log_error(f"Failed to initialize Gemini Flash Standard: {e}")
+    
+    try:
+        models["pro"] = GenerativeModel(config['GEMINI_PRO_MODEL_NAME'])
+        critical_failure = False  # At least one model initialized
+        logging.info(f"Successfully initialized Gemini Pro model: {config['GEMINI_PRO_MODEL_NAME']}")
+    except Exception as e:
+        log_error(f"Failed to initialize Gemini Pro: {e}")
+    
+    return models, critical_failure
+
 # --- Main Orchestration Loop ---
-# (run_simulation updated to handle feedback storage and MD save trigger)
 def run_simulation():
     """Main function to run the Genesis simulation."""
     logging.info(f"Starting {AGENT_NAME} Simulation...")
     print(f"--- {AGENT_NAME} ---")
     print("Enter commands: /pause, /chat, /resume, /quit")
-    # Initialize working memory with necessary keys
-    agent_state.working_memory = {'history':[], 'feedback_history':[], 'known_custom_tags': set()}
+    
+    # Initialize agent state
+    agent_state.reset_working_memory(preserve_tags=True)
 
     loop_count = 0 # Add a loop counter for debugging/monitoring
 
@@ -817,7 +1001,7 @@ def run_simulation():
                  logging.info("Quitting simulation via user command."); break
              elif command_lower == "/pause":
                  if agent_state.mode == "AUTONOMOUS":
-                      logging.info("Pause requested. Will pause after current cycle."); agent_state.working_memory['pause_requested'] = True
+                      logging.info("Pause requested. Will pause after current cycle."); agent_state.update_working_memory('pause_requested', True)
                  elif agent_state.mode == "CHATTING":
                       logging.info("Switching from Chat to Paused mode."); agent_state.mode = "PAUSED"; print("[MODE]: Paused. Enter /chat or /resume.")
                  else: # Already PAUSED
@@ -829,7 +1013,7 @@ def run_simulation():
                       print("Command ignored: Please /pause the simulation before entering /chat mode.")
              elif command_lower == "/resume":
                  if agent_state.mode == "PAUSED" or agent_state.mode == "CHATTING":
-                      logging.info("Resuming Autonomous Mode..."); agent_state.mode = "AUTONOMOUS"; agent_state.working_memory.pop('pause_requested', None); print("[MODE]: Autonomous")
+                      logging.info("Resuming Autonomous Mode..."); agent_state.mode = "AUTONOMOUS"; agent_state.pop_working_memory('pause_requested', None); print("[MODE]: Autonomous")
                  else: # Already AUTONOMOUS
                       logging.info("Already running in Autonomous Mode.")
              # Add other commands here if needed
@@ -853,14 +1037,16 @@ def run_simulation():
                  agent_state.current_task_input = current_input
 
             logging.info(f"Input: {current_input[:150]}...") # Log more input context
-            agent_state.working_memory.setdefault('history', []).append({"type": "input", "timestamp": datetime.datetime.now().isoformat(), "content": current_input})
+            agent_state.append_to_history({"type": "input", "timestamp": datetime.datetime.now().isoformat(), "content": current_input})
 
             # --- Execute Steps 2-9 ---
-            decision1 = decide_tool_needed(current_input, agent_state.working_memory); agent_state.working_memory['last_decision1'] = decision1
+            decision1 = decide_tool_needed(current_input, agent_state.working_memory)
+            agent_state.update_working_memory('last_decision1', decision1)
             next_step_input_data = None; tool_name = None; analysis_result = None; tool_result = None
 
             if decision1 and decision1.get("tool_needed"):
-                tool_info = identify_tool(current_input, agent_state.working_memory); agent_state.working_memory['last_tool_id'] = tool_info
+                tool_info = identify_tool(current_input, agent_state.working_memory)
+                agent_state.update_working_memory('last_tool_id', tool_info)
                 tool_name = tool_info.get("tool_name") if tool_info else None
                 tool_query = tool_info.get("query") if tool_info else None # Query might be None intentionally for some tools
                 if tool_name:
@@ -871,7 +1057,7 @@ def run_simulation():
                     else:
                         tool_result = execute_tool(tool_name, tool_query)
 
-                    agent_state.working_memory['last_tool_result'] = tool_result
+                    agent_state.update_working_memory('last_tool_result', tool_result)
                     next_step_input_data = tool_result # Data for analysis is the tool's raw output
                 else:
                     logging.warning("Tool needed, but identification failed or returned null tool. Proceeding without tool.")
@@ -894,7 +1080,7 @@ def run_simulation():
                 if summary_to_save and summary_to_save not in ["Analysis failed.", "Analysis response structure error."]:
                     topic_keys = analysis_result.get("suggested_tags", ["analysis_summary"]) # Use cleaned tags
                     saved_filepath = store_output_md(summary_to_save, topic_keys)
-                    if saved_filepath: agent_state.working_memory['last_md_saved_path'] = saved_filepath # Store path for potential LTR metadata
+                    if saved_filepath: agent_state.update_working_memory('last_md_saved_path', saved_filepath) # Store path for potential LTR metadata
                 else: log_error("Analysis requested saving MD, but summary was empty or invalid.")
             # --- End MD Save Trigger ---
 
@@ -902,26 +1088,28 @@ def run_simulation():
             # Decide whether to store this specific analysis in LTR immediately - Step 6
             # Only store if analysis was successful and deemed valuable
             if analysis_result and analysis_result.get("summary") not in ["Analysis failed.", "Analysis response structure error."]:
-                decision2 = decide_store_intermediate(analysis_result, agent_state.working_memory); agent_state.working_memory['last_decision2'] = decision2
+                decision2 = decide_store_intermediate(analysis_result, agent_state.working_memory)
+                agent_state.update_working_memory('last_decision2', decision2)
                 if decision2 and decision2.get("store_result"):
                     metadata_context = {"source": tool_name if tool_name else "unknown_source", "original_input": current_input}
                     # Add md filename to metadata if it was just saved
-                    if 'last_md_saved_path' in agent_state.working_memory:
-                         metadata_context['md_filename'] = os.path.basename(agent_state.working_memory['last_md_saved_path'])
+                    if agent_state.get_working_memory('last_md_saved_path'):
+                         metadata_context['md_filename'] = os.path.basename(agent_state.get_working_memory('last_md_saved_path'))
                     store_memory_step(analysis_result, metadata_context) # Call Step 7
 
             # Clear last_md_saved_path after potential use in metadata
-            agent_state.working_memory.pop('last_md_saved_path', None)
+            agent_state.pop_working_memory('last_md_saved_path', None)
 
             # Decide next action - Step 8
-            next_action = decide_next_action(agent_state.working_memory); agent_state.working_memory['last_decision3'] = next_action
+            next_action = decide_next_action(agent_state.working_memory)
+            agent_state.update_working_memory('last_decision3', next_action)
 
             # Handle task conclusion (includes potential final LTR storage)
             if next_action and next_action.get("conclude_task"):
                 logging.info(f"--- Task Concluded (Reason: {next_action.get('reason', 'N/A')}) ---")
                 # Optionally, store a final consolidated summary from working memory to LTR
                 # This logic could be refined: maybe only store if the whole task was useful?
-                final_summary_data = agent_state.working_memory.get('last_analysis')
+                final_summary_data = agent_state.get_working_memory('last_analysis')
                 if final_summary_data and final_summary_data.get("evaluation", "not helpful") != "not helpful": # Example condition
                     logging.info("Storing final task summary to LTR.")
                     metadata_context = {"source": "task_conclusion", "original_input": current_input} # Find initial input? Needs better history tracking maybe.
@@ -929,13 +1117,12 @@ def run_simulation():
                     # Add final MD file if relevant?
                     store_memory_step(final_summary_data, metadata_context) # Call Step 7
 
-                # Reset key parts of working memory for the next task, keep known tags
-                known_tags = agent_state.working_memory.get('known_custom_tags', set())
-                agent_state.working_memory = {'history':[], 'feedback_history':[], 'known_custom_tags': known_tags} # Keep history? Configurable reset?
+                # Reset working memory for the next task, preserving tags
+                agent_state.reset_working_memory(preserve_tags=True)
                 logging.info("Working memory reset for next task.")
+                
                 # Set a default next input if conclusion didn't provide one
                 agent_state.current_task_input = next_action.get("next_input") or "What interesting topic should I explore next?"
-
 
             else: # If not concluding, set input for the next loop
                 agent_state.current_task_input = next_action.get("next_input") if next_action else None
@@ -946,10 +1133,10 @@ def run_simulation():
 
             # --- Autonomous Loop End / Pause Check ---
             # Check pause request at end of loop cycle
-            if agent_state.working_memory.get('pause_requested'):
+            if agent_state.get_working_memory('pause_requested'):
                 logging.info("Pause command processed. Entering Paused Mode...");
                 agent_state.mode = "PAUSED";
-                agent_state.working_memory.pop('pause_requested') # Clear the flag
+                agent_state.pop_working_memory('pause_requested') # Clear the flag
                 print("[MODE]: Paused. Enter /chat or /resume.")
             else:
                  # Optional delay between autonomous loops to avoid hitting rate limits etc.
@@ -972,7 +1159,7 @@ def run_simulation():
                 print(f"\nGenesis: {chat_response}")
 
                 # Add chat interaction to history? Maybe a separate chat history?
-                # agent_state.working_memory.setdefault('chat_history', []).append({"user": user_chat_input, "agent": chat_response})
+                # agent_state.append_to_history({"type": "chat", "user": user_chat_input, "agent": chat_response})
 
             except queue.Empty:
                 # No new chat input, wait briefly
@@ -994,21 +1181,20 @@ def initialize_clients():
     logging.info("--- Initializing API Clients ---")
 
     if not initialize_vertex_ai():
-         log_error("Critical failure initializing Vertex AI. Aborting.")
-         return False # Vertex AI base (incl. embedding) is critical
+         log_error("Critical failure initializing Vertex AI. Attempting to continue with limited functionality.")
+         # Continue but with limited functionality instead of aborting
 
-    # Initialize Gemini Models
-    try:
-        logging.info(f"Initializing Gemini Flash Lite model: {config['GEMINI_FLASH_LITE_MODEL_NAME']}")
-        gemini_flash_lite_model = GenerativeModel(config['GEMINI_FLASH_LITE_MODEL_NAME'])
-        logging.info(f"Initializing Gemini Flash Standard model: {config['GEMINI_FLASH_STD_MODEL_NAME']}")
-        gemini_flash_std_model = GenerativeModel(config['GEMINI_FLASH_STD_MODEL_NAME'])
-        logging.info(f"Initializing Gemini Pro model: {config['GEMINI_PRO_MODEL_NAME']}")
-        gemini_pro_model = GenerativeModel(config['GEMINI_PRO_MODEL_NAME'])
-        logging.info("Gemini models initialized successfully.")
-    except Exception as e:
-         log_error(f"Failed to initialize Gemini models: {e}. Aborting.")
-         return False # Gemini models are critical for core logic
+    # Initialize Gemini Models with graceful degradation
+    gemini_models, critical_gemini_failure = initialize_gemini_models()
+    
+    # Assign models to global variables
+    gemini_flash_lite_model = gemini_models.get("flash_lite")
+    gemini_flash_std_model = gemini_models.get("flash_std")
+    gemini_pro_model = gemini_models.get("pro")
+    
+    if critical_gemini_failure:
+         log_error("Critical failure: No Gemini models could be initialized. Agent will have limited functionality.")
+         # Could continue with fallback behavior or reduced capabilities
 
     # --- Initialize other API clients (Optional - Log warnings if fail) ---
     if config.get("NEWS_API_KEY"):
@@ -1059,7 +1245,12 @@ def initialize_vertex_ai():
         # Load Embedding Model
         model_name = config.get('VERTEX_AI_EMBEDDING_MODEL', "text-embedding-005") # Default if missing
         logging.info(f"Loading Embedding Model: {model_name}")
-        embedding_model = TextEmbeddingModel.from_pretrained(model_name)
+        try:
+            embedding_model = TextEmbeddingModel.from_pretrained(model_name)
+            logging.info(f"Successfully loaded embedding model: {model_name}")
+        except Exception as e:
+            log_error(f"Failed to load embedding model: {e}")
+            # Continue with embedding_model as None
 
         # Initialize LTR (Vector Search) Endpoint Client if configured
         if endpoint_id:
@@ -1067,21 +1258,20 @@ def initialize_vertex_ai():
             # Ensure the endpoint ID is the full resource name, e.g., projects/.../indexEndpoints/...
             if not endpoint_id.startswith("projects/"):
                  log_error(f"VERTEX_AI_INDEX_ENDPOINT_ID seems incorrect. Expected format: projects/PROJECT_ID/locations/LOCATION/indexEndpoints/ENDPOINT_ID. Value: {endpoint_id}")
-                 # Attempt to construct it if possible? Risky. Better to fail.
-                 # endpoint_id = f"projects/{project}/locations/{location}/indexEndpoints/{endpoint_id.split('/')[-1]}"
-                 # logging.warning(f"Attempting to use constructed endpoint name: {endpoint_id}")
-                 return False # Fail if endpoint ID format looks wrong
-
-            ltr_endpoint = MatchingEngineIndexEndpoint(index_endpoint_name=endpoint_id)
-            # Optionally, you could try a cheap read operation like `ltr_endpoint.list_deployed_indexes()` here to verify connection/permissions early.
-            logging.info(f"LTR Endpoint Client initialized for: {ltr_endpoint.resource_name}")
+                 # Will not attempt to construct it - better to know there's an issue
+            else:
+                try:
+                    ltr_endpoint = MatchingEngineIndexEndpoint(index_endpoint_name=endpoint_id)
+                    logging.info(f"LTR Endpoint Client initialized for: {ltr_endpoint.resource_name}")
+                except Exception as e:
+                    log_error(f"Failed to initialize LTR endpoint: {e}")
+                    # Continue with ltr_endpoint as None
+                
             if not config.get("VERTEX_AI_DEPLOYED_INDEX_ID"):
                 logging.error("CRITICAL: VERTEX_AI_DEPLOYED_INDEX_ID not set. LTR queries will fail.") # Error level now
-                # Potentially return False here if LTR is absolutely essential? Depends on requirements.
         else:
             logging.warning("VERTEX_AI_INDEX_ENDPOINT_ID not set. LTR functions (store/query) will not work.")
 
-        logging.info("Vertex AI base initialized successfully.")
         return True
     except Exception as e:
         log_error(f"Failed to initialize Vertex AI or load models/clients: {e}")
@@ -1108,8 +1298,8 @@ if __name__ == "__main__":
 
     # Initialize all API clients
     if not initialize_clients():
-         print("Exiting due to critical client initialization failure. Check error logs.", file=sys.stderr)
-         sys.exit(1)
+         print("Warning: Some client initialization failed. Continuing with limited functionality.", file=sys.stderr)
+         # Continue with limited functionality instead of exiting
 
     # Start the simulation loop
     run_simulation()
