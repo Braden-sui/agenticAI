@@ -27,7 +27,7 @@ from vertexai.generative_models import GenerativeModel, Part, GenerationConfig, 
 import requests
 import wikipedia
 import openai
-from newsapi import NewsApiClient
+from newsapi.newsapi_client import NewsApiClient
 # import wolframalpha # Currently using requests for Wolfram Alpha
 
 # Configure basic logging
@@ -599,7 +599,7 @@ Respond ONLY with JSON in the format:
 }}"""
     # --- End Updated Prompt ---
     response = call_gemini_flash_std(prompt, "Tool ID")
-    
+
     # Validate response schema
     default_values = {"tool_name": None, "query": None, "reason": "LLM call failed"}
     response = validate_response_schema(response, ["tool_name", "query", "reason"], default_values)
@@ -1212,8 +1212,7 @@ def initialize_clients():
          logging.warning("WOLFRAM_APP_ID not found in config. Wolfram Alpha tool will not work.")
     else:
          logging.info("Wolfram Alpha App ID found.")
-
-
+    
     # Example for OpenAI if it were used (currently isn't in tool map)
     if config.get("OPENAI_API_KEY"):
         try:
